@@ -43,11 +43,8 @@ try:
     HAS_PT = True
 except ImportError:
     HAS_PT = False
-try:
-    from duckduckgo_search import DDGS
-    HAS_DDG = True
-except ImportError:
-    HAS_DDG = False
+
+# HAS_DDG and HAS_FETCH are defined in the WEB SEARCH section below
 
 if MISSING:
     print(f"\n[ SETUP ]  pip install {' '.join(MISSING)}")
@@ -87,12 +84,16 @@ LANG_EXT = {
 
 CODE_FENCE = re.compile(r"```(?P<lang>[a-zA-Z0-9+\-#._]*)\n(?P<code>.*?)```", re.DOTALL)
 
-# web-search trigger words
+# web-search trigger heuristics
 WEB_TRIGGERS = re.compile(
     r"\b(latest|current|today|now|news|price|weather|stock|2024|2025|2026"
-    r"|who is|what is happening|recent|live|trending|release|update)\b",
+    r"|who is|what is|when did|recent|live|trending|release|update|score"
+    r"|match|result|happening|died|elected|launched|announced|version)\b",
     re.IGNORECASE,
 )
+
+# search agent model — small, fast, free-tier on NIM
+SEARCH_MODEL_ID = "meta/llama-3.2-3b-instruct"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PALETTE
@@ -188,7 +189,7 @@ if HAS_PT:
 def get_input(chat_name:str, model_label:str, turn:int, sys_active:bool=False)->str:
     tags = []
     if sys_active: tags.append("[SYS]")
-    if CFG.get("web_search") and HAS_DDG: tags.append("[WEB]")
+    if CFG.get("web_search") and HAS_DDG and HAS_FETCH: tags.append("[WEB]")
     tag_str = ("  " + "  ".join(tags)) if tags else ""
     if HAS_PT and _PT_STYLE:
         toolbar = _HTML(
@@ -219,7 +220,7 @@ def splash():
         art.append(line+"\n", style=style)
     chats = Chat.all_chats()
     total = sum(c.token_in+c.token_out for c in chats)
-    web   = f"  [{P['web']}][WEB][/{P['web']}]" if HAS_DDG else ""
+    web   = f"  [{P['web']}][WEB BETA][/{P['web']}]" if (HAS_DDG and HAS_FETCH) else ""
     art.append(f"\nNVIDIA NIM  ·  Terminal AI  ·  v{VERSION}", style="bold white")
     stats = (
         f"[{P['dim']}]{len(chats)} chats  ·  ~{total:,} tokens{web}[/{P['dim']}]"
@@ -284,40 +285,226 @@ def choose_model(current:dict|None=None)->dict:
         con.print(f"  [{P['err']}]Invalid[/{P['err']}]")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  WEB SEARCH
+#  WEB SEARCH  [BETA]  — Two-agent RAG pipeline
+#
+#  Agent-1  SearchAgent  (backend only, never shown in chat UI)
+#    • DuckDuckGo  → top N URLs + snippets
+#    • requests    → fetch each page, BeautifulSoup → clean text
+#    • small NIM model → extract only the sentences relevant to the query
+#    → produces numbered Citation objects with real URLs
+#
+#  Agent-2  Main model  (the chat model the user talks to)
+#    → receives a structured [WEB CONTEXT] block injected into the system
+#       prompt so it *knows* it has real-time data and must cite sources
+#    → always responds with inline citations like [1] [2]
+#
+#  Off by default. Enable in /settings.
 # ═══════════════════════════════════════════════════════════════════════════════
-def web_search(query:str, n:int=4)->list[dict]:
-    """Run DuckDuckGo search; return list of {title,url,body}."""
-    if not HAS_DDG: return []
+try:
+    import requests as _requests
+    from bs4 import BeautifulSoup as _BS
+    HAS_FETCH = True
+except ImportError:
+    HAS_FETCH = False
+
+try:
+    from duckduckgo_search import DDGS
+    HAS_DDG = True
+except ImportError:
+    HAS_DDG = False
+
+# ── dataclass-lite ─────────────────────────────────────────────────────────────
+class Citation:
+    __slots__ = ("index","title","url","extract")
+    def __init__(self,index:int,title:str,url:str,extract:str):
+        self.index   = index
+        self.title   = title
+        self.url     = url
+        self.extract = extract
+
+    def as_context_block(self)->str:
+        return (
+            f"[{self.index}] {self.title}\n"
+            f"    URL: {self.url}\n"
+            f"    Content: {self.extract}\n"
+        )
+
+# ── page fetcher ──────────────────────────────────────────────────────────────
+_FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+_SKIP_DOMAINS = {"youtube.com","youtu.be","reddit.com","twitter.com",
+                 "x.com","instagram.com","facebook.com","tiktok.com"}
+
+def _fetch_page(url:str, timeout:int=5)->str:
+    """Fetch a URL and return clean visible text (max ~3000 chars)."""
+    if not HAS_FETCH:
+        return ""
+    try:
+        dom = re.search(r"https?://(?:www\.)?([^/]+)", url)
+        if dom and any(s in dom.group(1) for s in _SKIP_DOMAINS):
+            return ""
+        r = _requests.get(url, headers=_FETCH_HEADERS, timeout=timeout,
+                          allow_redirects=True)
+        if r.status_code != 200:
+            return ""
+        soup = _BS(r.text, "html.parser")
+        # remove noise tags
+        for tag in soup(["script","style","nav","footer","header",
+                         "aside","iframe","noscript","form","button"]):
+            tag.decompose()
+        # prefer article/main content
+        body = soup.find("article") or soup.find("main") or soup.body
+        if body is None:
+            return ""
+        text = " ".join(body.get_text(" ", strip=True).split())
+        return text[:4000]
+    except Exception:
+        return ""
+
+# ── relevance extractor (search-agent model call) ─────────────────────────────
+def _extract_relevant(client:OpenAI, query:str, page_text:str, source_num:int)->str:
+    """
+    Call the lightweight search-agent model to pull only relevant sentences
+    from raw page text. Returns a condensed extract (≤ 400 chars).
+    Falls back to first 400 chars of page_text if the model call fails.
+    """
+    if not page_text.strip():
+        return ""
+    snippet = page_text[:3000]
+    prompt  = (
+        f"Extract 3-5 sentences from the text below that are most relevant "
+        f"to answering: \"{query}\"\n"
+        f"Reply with ONLY those sentences, no extra commentary.\n\n"
+        f"TEXT:\n{snippet}"
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=SEARCH_MODEL_ID,
+            messages=[{"role":"user","content":prompt}],
+            max_tokens=300,
+            temperature=0.1,
+            stream=False,
+        )
+        if resp.choices:
+            return resp.choices[0].message.content.strip()[:600]
+    except Exception:
+        pass
+    # fallback: first meaningful chunk
+    return snippet[:400].rsplit(" ",1)[0]+"…"
+
+# ── DDG search ────────────────────────────────────────────────────────────────
+def _ddg_search(query:str, n:int)->list[dict]:
+    """Return raw DDG results [{title,url,body}]."""
+    if not HAS_DDG:
+        return []
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=n))
-        return [{"title":r.get("title",""),"url":r.get("href",""),"body":r.get("body","")} for r in results]
+            return [
+                {"title":r.get("title",""),"url":r.get("href",""),"body":r.get("body","")}
+                for r in ddgs.text(query, max_results=n)
+            ]
     except Exception:
         return []
 
+# ── main search-agent entry point ─────────────────────────────────────────────
+def run_search_agent(client:OpenAI, query:str, n:int=4) -> list[Citation]:
+    """
+    Full pipeline:
+      1. DDG → top N results
+      2. For each: fetch page → extract relevant text via small model
+      3. Return list[Citation] with real URLs and condensed extracts
+    [BETA] — backend only, never shown in main chat UI directly.
+    """
+    if not HAS_DDG:
+        return []
+
+    raw = _ddg_search(query, n)
+    if not raw:
+        return []
+
+    citations: list[Citation] = []
+    for i, r in enumerate(raw, 1):
+        url     = r.get("url","")
+        title   = r.get("title","") or url
+        snippet = r.get("body","")
+
+        # try to fetch full page, fall back to DDG snippet
+        page_text = _fetch_page(url) if url else ""
+        if len(page_text) > 200:
+            extract = _extract_relevant(client, query, page_text, i)
+        elif snippet:
+            extract = snippet[:400]
+        else:
+            extract = ""
+
+        if not extract:
+            continue
+
+        citations.append(Citation(
+            index   = len(citations)+1,
+            title   = title[:120],
+            url     = url,
+            extract = extract,
+        ))
+        if len(citations) >= n:
+            break
+
+    return citations
+
+# ── context block injected into system prompt ─────────────────────────────────
+def build_web_context_block(citations:list[Citation], query:str)->str:
+    if not citations:
+        return ""
+    header = (
+        "═══════════════════════════════════════════\n"
+        "REAL-TIME WEB SEARCH RESULTS\n"
+        f"Query: {query}\n"
+        "Retrieved: " + datetime.now().strftime("%Y-%m-%d %H:%M UTC") + "\n"
+        "═══════════════════════════════════════════\n\n"
+    )
+    body = "\n".join(c.as_context_block() for c in citations)
+    footer = (
+        "\n═══════════════════════════════════════════\n"
+        "INSTRUCTIONS FOR USING WEB RESULTS:\n"
+        "• You HAVE been given real-time web data above. Do NOT say you cannot search.\n"
+        "• Cite every fact with inline numbers, e.g. [1] or [2][3].\n"
+        "• At the end of your reply include a 'Sources:' section listing each [N] URL.\n"
+        "• If results are irrelevant, say so and answer from your own knowledge.\n"
+        "═══════════════════════════════════════════\n"
+    )
+    return header + body + footer
+
+# ── should we search? ─────────────────────────────────────────────────────────
 def _should_search(text:str)->bool:
-    return CFG.get("web_search") and HAS_DDG and bool(WEB_TRIGGERS.search(text))
+    if not CFG.get("web_search"):
+        return False
+    if not HAS_DDG:
+        return False
+    return bool(WEB_TRIGGERS.search(text))
 
-def _format_search_context(results:list[dict])->str:
-    if not results: return ""
-    lines = ["[Web Search Results — use these to answer accurately]\n"]
-    for i,r in enumerate(results,1):
-        lines.append(f"{i}. **{r['title']}**\n   {r['url']}\n   {r['body'][:300]}\n")
-    return "\n".join(lines)
-
-def show_search_results(results:list[dict]):
-    """Print search result banner before AI response."""
-    if not results: return
-    t = Table(box=box.SIMPLE,border_style=P["web"],show_header=False,padding=(0,2))
-    t.add_column("#",style=f"bold {P['web']}",width=3)
-    t.add_column("Result",style=P["dim"])
-    for i,r in enumerate(results,1):
-        title = r["title"][:60]+"…" if len(r["title"])>60 else r["title"]
-        t.add_row(str(i),f"[bold]{escape(title)}[/bold]\n[{P['dim']}]{r['url'][:70]}[/{P['dim']}]")
-    con.print(Panel(t,title=f"[{P['web']}]  Web Search  [/{P['web']}]",
-                    border_style=P["web"],box=box.ROUNDED,padding=(0,1)))
+# ── UI: show citation panel (above AI reply) ──────────────────────────────────
+def show_citations_panel(citations:list[Citation]):
+    if not citations:
+        return
+    t = Table(box=box.SIMPLE,border_style=P["web"],show_header=False,padding=(0,1))
+    t.add_column("#",   style=f"bold {P['web']}", width=3)
+    t.add_column("Source", style=P["dim"], min_width=30)
+    t.add_column("URL",    style=P["web"], min_width=28)
+    for c in citations:
+        title = (c.title[:45]+"…") if len(c.title)>45 else c.title
+        url   = (c.url[:50]+"…")   if len(c.url)>50   else c.url
+        t.add_row(f"[{c.index}]", escape(title), escape(url))
+    con.print(Panel(
+        t,
+        title=f"[{P['web']}]  ⊕ Web Search  [BETA]  [/{P['web']}]",
+        border_style=P["web"], box=box.ROUNDED, padding=(0,1),
+    ))
     con.print()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SYSTEM PROMPT PRESETS
@@ -440,9 +627,9 @@ def show_settings():
                 vstr = str(val)
                 opts = "free value"
             # dim if web search not installed
-            if k=="web_search" and not HAS_DDG:
-                vstr = f"[{P['dim']}]needs: pip install duckduckgo-search[/{P['dim']}]"
-            if k=="web_search_results" and not HAS_DDG:
+            if k=="web_search" and not (HAS_DDG and HAS_FETCH):
+                vstr = f"[{P['dim']}]needs: pip install duckduckgo-search requests beautifulsoup4[/{P['dim']}]"
+            if k=="web_search_results" and not (HAS_DDG and HAS_FETCH):
                 vstr = f"[{P['dim']}]n/a[/{P['dim']}]"
             t.add_row(str(i), label, vstr, opts)
 
@@ -470,8 +657,11 @@ def show_settings():
         label,typ,default,choices = meta
 
         # web search guard
-        if k in ("web_search","web_search_results") and not HAS_DDG:
-            con.print(f"  [{P['warn']}]Install first:  pip install duckduckgo-search[/{P['warn']}]")
+        if k in ("web_search","web_search_results") and not (HAS_DDG and HAS_FETCH):
+            missing = []
+            if not HAS_DDG:   missing.append("duckduckgo-search")
+            if not HAS_FETCH: missing.append("requests beautifulsoup4")
+            con.print(f"  [{P['warn']}]Install first:  pip install {' '.join(missing)}[/{P['warn']}]")
             con.print(); continue
 
         cur = CFG.get(k)
@@ -777,7 +967,7 @@ def show_info(chat:Chat,model:dict,turn:int,session_start:float):
         ("Files",str(len(codes))),("Folder",str(chat.codes_dir)),
         ("",""),
         (f"[{P['accent']}]── FEATURES[/{P['accent']}]",""),
-        ("Web search",f"[{P['ok']}]ON[/{P['ok']}]" if (CFG.get("web_search") and HAS_DDG) else f"[{P['dim']}]OFF[/{P['dim']}]"),
+        ("Web search",f"[{P['ok']}]ON (beta)[/{P['ok']}]" if (CFG.get("web_search") and HAS_DDG and HAS_FETCH) else f"[{P['dim']}]OFF[/{P['dim']}]"),
         ("Code theme",CFG.get("code_theme")),
         ("Memory turns",f"{len(chat.messages)//2} / {CFG.get('max_memory_turns')}"),
     ]
@@ -957,7 +1147,7 @@ def render_formatted_reply(reply:str, chat:Chat, model_label:str):
 #  STREAM → REPLACE
 # ═══════════════════════════════════════════════════════════════════════════════
 def stream_response(client:OpenAI, chat:Chat, model:dict, messages:list,
-                    search_results:list|None=None)->str:
+                    citations:list|None=None)->str:
 
     def _attempt(msgs:list)->tuple:
         buf=[]; err=None
@@ -1007,8 +1197,8 @@ def stream_response(client:OpenAI, chat:Chat, model:dict, messages:list,
         con.print(f"  [{P['dim']}]~{tok} tokens[/{P['dim']}]")
 
     con.print()
-    if search_results:
-        show_search_results(search_results)
+    if citations:
+        show_citations_panel(citations)
     render_formatted_reply(reply, chat, model["label"])
     return reply
 
@@ -1051,7 +1241,7 @@ def _chat_header(chat:Chat,model:dict):
         ))
     else:
         sys_tag = f"  [{P['sys']}][SYS][/{P['sys']}]" if chat.custom_system else ""
-        web_tag = f"  [{P['web']}][WEB][/{P['web']}]" if (CFG.get("web_search") and HAS_DDG) else ""
+        web_tag = f"  [{P['web']}][WEB][/{P['web']}]" if (CFG.get("web_search") and HAS_DDG and HAS_FETCH) else ""
         codes   = len(list(chat.codes_dir.glob("*")))
         con.print(Panel(
             f"[{P['chat']}]{escape(chat.name)}[/{P['chat']}]{sys_tag}{web_tag}"
@@ -1095,37 +1285,51 @@ def chat_loop(client:OpenAI, model:dict, chat:Chat):
         if cmd=="/model":
             con.print(); model=choose_model(current=model); con.print(); _chat_header(chat,model); continue
 
-        # ── web search (auto) ─────────────────────────────────────────────
-        search_results=[]
+        # ── two-agent web search [BETA] ───────────────────────────────────
+        citations: list[Citation] = []
+        web_sys_block = ""
+
         if _should_search(user_input):
-            con.print(f"  [{P['web']}]⊕ Web search…[/{P['web']}]")
-            search_results=web_search(user_input,n=CFG.get("web_search_results"))
+            con.print(
+                f"  [{P['web']}]⊕  Search agent running…[/{P['web']}]"
+                f"  [{P['dim']}](fetching pages + extracting)[/{P['dim']}]"
+            )
+            citations = run_search_agent(
+                client, user_input, n=CFG.get("web_search_results")
+            )
+            if citations:
+                web_sys_block = build_web_context_block(citations, user_input)
+                con.print(
+                    f"  [{P['web']}]✓  {len(citations)} sources ready[/{P['web']}]"
+                )
+            else:
+                con.print(
+                    f"  [{P['warn']}]⚠  No results — answering from training data[/{P['warn']}]"
+                )
+            con.print()
 
         # ── send ──────────────────────────────────────────────────────────
         turn+=1
-        msg_content=user_input
-        if search_results:
-            ctx_text=_format_search_context(search_results)
-            msg_content=f"{user_input}\n\n{ctx_text}"
-
-        chat.add("user",user_input)   # store clean user message
+        chat.add("user", user_input)
 
         con.print(Panel(
             f"[{P['user']}]{escape(user_input)}[/{P['user']}]",
-            title=f"[{P['user']}] You [/{P['user']}]",title_align="right",
-            border_style=P["dim"],box=box.ROUNDED,padding=(0,2)))
+            title=f"[{P['user']}] You [/{P['user']}]", title_align="right",
+            border_style=P["dim"], box=box.ROUNDED, padding=(0,2),
+        ))
         con.print()
 
-        # build messages with search context injected into last user turn
-        history_for_api=list(chat.messages)
-        if search_results and history_for_api:
-            last=history_for_api[-1]
-            if last["role"]=="user":
-                history_for_api[-1]={"role":"user","content":msg_content}
+        # build system content — web context injected AT THE TOP of the
+        # system prompt so the model sees it before anything else
+        sys_content = build_system_content(chat, model)
+        if web_sys_block:
+            sys_content = web_sys_block + "\n\n" + sys_content
 
-        sys_content=build_system_content(chat,model)
-        msgs=build_api_messages(sys_content,history_for_api,model["id"])
-        reply=stream_response(client,chat,model,msgs,search_results=search_results if search_results else None)
+        msgs = build_api_messages(sys_content, chat.messages, model["id"])
+        reply = stream_response(
+            client, chat, model, msgs,
+            citations=citations if citations else None,
+        )
 
         chat.add("assistant",reply); con.print()
 
